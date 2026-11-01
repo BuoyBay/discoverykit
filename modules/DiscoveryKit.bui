@@ -1,0 +1,359 @@
+' Independent bounded DNS wire codec and opt-in IPv4 DNS-SD transport.
+
+Public Class DNSQuestion
+    Public Property Name As String
+    Public Property RecordType As Integer
+    Public Property RecordClass As Integer
+    Public Property UnicastResponse As Boolean
+End Class
+
+Public Class DNSRecord
+    Public Property Name As String
+    Public Property RecordType As Integer
+    Public Property RecordClass As Integer
+    Public Property CacheFlush As Boolean
+    Public Property TTL As Integer
+    Public Property Data As Bytes
+    Public Property Target As String
+    Public Property Priority As Integer
+    Public Property Weight As Integer
+    Public Property Port As Integer
+    Public Property Address As String
+    Public Property TextValues As Array Of Bytes
+End Class
+
+Public Class DNSMessage
+    Public Property Identifier As Integer
+    Public Property Flags As Integer
+    Public Property Questions As Array Of DNSQuestion
+    Public Property Answers As Array Of DNSRecord
+    Public Property Authorities As Array Of DNSRecord
+    Public Property Additionals As Array Of DNSRecord
+
+    Public Function IsResponse() As Boolean
+        Return (Me.Flags And 32768) <> 0
+    End Function
+
+    Public Function IsTruncated() As Boolean
+        Return (Me.Flags And 512) <> 0
+    End Function
+End Class
+
+Private Sub DNSRequire(valid As Boolean, message As String)
+    If Not valid Then Throw New InvalidArgumentException("DiscoveryKit: " + message)
+End Sub
+
+Private Function DNSCopy(data As Bytes, first As Integer, length As Integer) As Bytes
+    Dim output As New Bytes(length)
+    For i As Integer = first To first + length - 1
+        output.Append(data.Item(i))
+    Next
+    Return output
+End Function
+
+Private Function DNSRead16(data As Bytes, ByRef position As Integer, limit As Integer) As Integer
+    DNSRequire(position >= 0 And position + 2 <= limit, "truncated 16-bit value")
+    Dim value As Integer = data.Item(position) * 256 + data.Item(position + 1)
+    position += 2
+    Return value
+End Function
+
+Private Function DNSRead32(data As Bytes, ByRef position As Integer, limit As Integer) As Integer
+    Dim high As Integer = DNSRead16(data, position, limit)
+    Dim low As Integer = DNSRead16(data, position, limit)
+    Return high * 65536 + low
+End Function
+
+Private Sub DNSWrite16(data As Bytes, value As Integer)
+    DNSRequire(value >= 0 And value <= 65535, "16-bit value outside range")
+    data.Append(value \ 256)
+    data.Append(value Mod 256)
+End Sub
+
+Private Function DNSPresentationByte(value As Integer) As String
+    If value >= 33 And value <= 126 And value <> 46 And value <> 92 Then Return String.Chr(value)
+    Return "\\" + Str(value \ 100) + Str((value \ 10) Mod 10) + Str(value Mod 10)
+End Function
+
+' The initial encoded bytes must remain inside limit; compression may refer backward elsewhere.
+Private Function DNSReadName(data As Bytes, ByRef position As Integer, limit As Integer) As String
+    Dim cursor As Integer = position
+    Dim jumped As Boolean = False
+    Dim expanded As Integer = 1
+    Dim steps As Integer = 0
+    Dim output As String = ""
+    While True
+        Dim boundary As Integer = limit
+        If jumped Then boundary = data.Count
+        DNSRequire(cursor >= 12 And cursor < boundary, "truncated DNS name")
+        Dim size As Integer = data.Item(cursor)
+        If size >= 192 Then
+            steps += 1
+            DNSRequire(steps <= 128, "name compression depth exceeds 128")
+            DNSRequire(cursor + 1 < boundary, "truncated compression pointer")
+            Dim destination As Integer = (size - 192) * 256 + data.Item(cursor + 1)
+            DNSRequire(destination >= 12 And destination < cursor, "compression pointer must refer backward into DNS body")
+            If Not jumped Then position = cursor + 2
+            jumped = True
+            cursor = destination
+        ElseIf size >= 64 Then
+            Throw New InvalidArgumentException("DiscoveryKit: reserved DNS label encoding")
+        ElseIf size = 0 Then
+            If Not jumped Then position = cursor + 1
+            If output = "" Then Return "."
+            Return output
+        Else
+            DNSRequire(cursor + 1 + size <= boundary, "truncated label")
+            expanded += size + 1
+            DNSRequire(expanded <= 255, "expanded DNS name exceeds 255 bytes")
+            For i As Integer = cursor + 1 To cursor + size
+                output += DNSPresentationByte(data.Item(i))
+            Next
+            output += "."
+            cursor += size + 1
+            If Not jumped Then position = cursor
+        End If
+    End While
+End Function
+
+''' Encode a DNS presentation name, supporting decimal byte escapes (backslash plus exactly three digits).
+Public Function EncodeDNSName(name As String) As Bytes
+    Dim source As Bytes = Bytes.FromString(name, Text.Encodings.UTF8)
+    DNSRequire(source.Count > 0 And source.Count <= 1024, "empty or oversized presentation name")
+    Dim output As New Bytes()
+    If name = "." Then
+        output.Append(0)
+        Return output
+    End If
+    Dim label As New Bytes()
+    Dim cursor As Integer = 0
+    While cursor < source.Count
+        Dim value As Integer = source.Item(cursor)
+        If value = 46 Then
+            DNSRequire(label.Count > 0 And label.Count <= 63, "empty or oversized DNS label")
+            output.Append(label.Count)
+            output.Append(label)
+            label = New Bytes()
+            cursor += 1
+        ElseIf value = 92 Then
+            DNSRequire(cursor + 3 < source.Count, "DNS escape needs three decimal digits")
+            Dim decoded As Integer = 0
+            For i As Integer = 1 To 3
+                Dim digit As Integer = source.Item(cursor + i)
+                DNSRequire(digit >= 48 And digit <= 57, "DNS escape needs three decimal digits")
+                decoded = decoded * 10 + digit - 48
+            Next
+            DNSRequire(decoded <= 255, "DNS escaped byte exceeds 255")
+            label.Append(decoded)
+            cursor += 4
+        Else
+            label.Append(value)
+            cursor += 1
+        End If
+        DNSRequire(label.Count <= 63, "DNS name exceeds wire limits")
+    End While
+    If label.Count > 0 Then
+        output.Append(label.Count)
+        output.Append(label)
+    End If
+    output.Append(0)
+    DNSRequire(output.Count <= 255, "DNS name exceeds 255 bytes")
+    Return output
+End Function
+
+''' Decode a presentation name into owned raw label bytes; UTF-8 conversion is caller-controlled.
+Public Function DNSNameLabels(name As String) As Array Of Bytes
+    Dim encoded As Bytes = EncodeDNSName(name)
+    Dim labels() As Bytes
+    Dim position As Integer = 0
+    While encoded.Item(position) <> 0
+        Dim size As Integer = encoded.Item(position)
+        position += 1
+        Array.Append(labels, DNSCopy(encoded, position, size))
+        position += size
+    End While
+    Return labels
+End Function
+
+''' Single IN-class question. QU requests a unicast response to an mDNS query.
+Public Function BuildDNSQuery(name As String, recordType As Integer = 12, identifier As Integer = 0, unicastResponse As Boolean = False) As Bytes
+    Dim encoded As Bytes = EncodeDNSName(name)
+    DNSRequire(recordType >= 1 And recordType <= 65535, "invalid question type")
+    Dim output As New Bytes()
+    DNSWrite16(output, identifier)
+    DNSWrite16(output, 0)
+    DNSWrite16(output, 1)
+    DNSWrite16(output, 0)
+    DNSWrite16(output, 0)
+    DNSWrite16(output, 0)
+    output.Append(encoded)
+    DNSWrite16(output, recordType)
+    Dim recordClass As Integer = 1
+    If unicastResponse Then recordClass += 32768
+    DNSWrite16(output, recordClass)
+    Return output
+End Function
+
+Private Function DNSReadRecord(data As Bytes, ByRef position As Integer) As DNSRecord
+    Dim output As New DNSRecord()
+    output.Name = DNSReadName(data, position, data.Count)
+    output.RecordType = DNSRead16(data, position, data.Count)
+    Dim rawClass As Integer = DNSRead16(data, position, data.Count)
+    output.RecordClass = rawClass And 32767
+    output.CacheFlush = (rawClass And 32768) <> 0
+    output.TTL = DNSRead32(data, position, data.Count)
+    Dim length As Integer = DNSRead16(data, position, data.Count)
+    Dim finish As Integer = position + length
+    DNSRequire(finish <= data.Count, "truncated resource data")
+    output.Data = DNSCopy(data, position, length)
+    Select Case output.RecordType
+        Case 1
+            DNSRequire(length = 4, "A record must hold four bytes")
+            output.Address = Str(data.Item(position)) + "." + Str(data.Item(position + 1)) + "." + Str(data.Item(position + 2)) + "." + Str(data.Item(position + 3))
+        Case 28
+            DNSRequire(length = 16, "AAAA record must hold sixteen bytes")
+            Dim hex As String = "0123456789abcdef"
+            Dim address As String = ""
+            For i As Integer = position To finish - 1
+                If i > position And (i - position) Mod 2 = 0 Then address += ":"
+                Dim value As Integer = data.Item(i)
+                address += String.Substring(hex, value \ 16, 1) + String.Substring(hex, value Mod 16, 1)
+            Next
+            output.Address = address
+        Case 12, 5, 2
+            Dim namePosition As Integer = position
+            output.Target = DNSReadName(data, namePosition, finish)
+            DNSRequire(namePosition = finish, "extra bytes after target name")
+        Case 33
+            Dim srvPosition As Integer = position
+            output.Priority = DNSRead16(data, srvPosition, finish)
+            output.Weight = DNSRead16(data, srvPosition, finish)
+            output.Port = DNSRead16(data, srvPosition, finish)
+            output.Target = DNSReadName(data, srvPosition, finish)
+            DNSRequire(srvPosition = finish, "extra bytes after SRV target")
+        Case 16
+            Dim texts() As Bytes
+            If length = 0 Then Array.Append(texts, New Bytes())
+            Dim txtPosition As Integer = position
+            While txtPosition < finish
+                Dim size As Integer = data.Item(txtPosition)
+                txtPosition += 1
+                DNSRequire(txtPosition + size <= finish, "truncated TXT string")
+                Array.Append(texts, DNSCopy(data, txtPosition, size))
+                txtPosition += size
+            End While
+            output.TextValues = texts
+    End Select
+    position = finish
+    Return output
+End Function
+
+''' Decode one complete datagram. Unknown RRs retain exact raw Data; malformed input rejects atomically.
+Public Function ParseDNSMessage(data As Bytes, maxPacketBytes As Integer = 9000, maxItems As Integer = 512) As DNSMessage
+    DNSRequire(data <> Nil, "Nil packet")
+    DNSRequire(maxPacketBytes >= 12 And maxPacketBytes <= 65535, "packet budget outside 12..65535")
+    DNSRequire(maxItems >= 0 And maxItems <= 4096, "item budget outside 0..4096")
+    DNSRequire(data.Count >= 12 And data.Count <= maxPacketBytes, "packet truncated or over budget")
+    Dim output As New DNSMessage()
+    Dim position As Integer = 0
+    output.Identifier = DNSRead16(data, position, data.Count)
+    output.Flags = DNSRead16(data, position, data.Count)
+    Dim questionCount As Integer = DNSRead16(data, position, data.Count)
+    Dim answerCount As Integer = DNSRead16(data, position, data.Count)
+    Dim authorityCount As Integer = DNSRead16(data, position, data.Count)
+    Dim additionalCount As Integer = DNSRead16(data, position, data.Count)
+    DNSRequire(questionCount + answerCount + authorityCount + additionalCount <= maxItems, "item budget exceeded")
+    Dim questions() As DNSQuestion
+    For i As Integer = 1 To questionCount
+        Dim question As New DNSQuestion()
+        question.Name = DNSReadName(data, position, data.Count)
+        question.RecordType = DNSRead16(data, position, data.Count)
+        Dim rawClass As Integer = DNSRead16(data, position, data.Count)
+        question.RecordClass = rawClass And 32767
+        question.UnicastResponse = (rawClass And 32768) <> 0
+        Array.Append(questions, question)
+    Next
+    output.Questions = questions
+    Dim answers() As DNSRecord
+    For i As Integer = 1 To answerCount
+        Array.Append(answers, DNSReadRecord(data, position))
+    Next
+    output.Answers = answers
+    Dim authorities() As DNSRecord
+    For i As Integer = 1 To authorityCount
+        Array.Append(authorities, DNSReadRecord(data, position))
+    Next
+    output.Authorities = authorities
+    Dim additionals() As DNSRecord
+    For i As Integer = 1 To additionalCount
+        Array.Append(additionals, DNSReadRecord(data, position))
+    Next
+    output.Additionals = additionals
+    DNSRequire(position = data.Count, "trailing bytes outside DNS sections")
+    Return output
+End Function
+
+Public Class DiscoveryDatagram
+    Public Property Message As DNSMessage
+    Public Property PeerAddress As String
+    Public Property PeerPort As Integer
+End Class
+
+''' Explicit-lifecycle IPv4 transport. No socket is opened until Open is called.
+Public Class DiscoverySession
+    Private Property socket As UDPSocket
+    Private Property closed As Boolean = False
+
+    Public Property LocalPort As Integer
+        Get
+            If Me.socket = Nil Then Return 0
+            Return Me.socket.LocalPort
+        End Get
+    End Property
+
+    Public Sub Open(localPort As Integer = 0, joinMulticast As Boolean = False, interfaceAddress As String = "0.0.0.0")
+        DNSRequire(Not Me.closed And Me.socket = Nil, "session already opened or closed")
+        DNSRequire(localPort >= 0 And localPort <= 65535, "invalid local port")
+        If joinMulticast Then DNSRequire(localPort = 5353, "mDNS multicast reception requires port 5353")
+        Dim transport As New UDPSocket()
+        Try
+            transport.MulticastTTL = 255
+            transport.Bind(localPort)
+            If joinMulticast Then transport.JoinMulticastGroup("224.0.0.251", interfaceAddress)
+            Me.socket = transport
+        Catch failure As Exception
+            transport.Close()
+            Throw failure
+        End Try
+    End Sub
+
+    Public Sub SendQuery(name As String, recordType As Integer = 12, destination As String = "224.0.0.251", destinationPort As Integer = 5353, identifier As Integer = 0, unicastResponse As Boolean = False)
+        DNSRequire(Not Me.closed And Me.socket <> Nil, "session is not open")
+        DNSRequire(destinationPort > 0 And destinationPort <= 65535, "invalid destination port")
+        Me.socket.Write(BuildDNSQuery(name, recordType, identifier, unicastResponse), destination, destinationPort)
+    End Sub
+
+    Public Function HasPendingDatagram() As Boolean
+        DNSRequire(Not Me.closed And Me.socket <> Nil, "session is not open")
+        Return Me.socket.HasPendingDatagram()
+    End Function
+
+    Public Function Receive(maxPacketBytes As Integer = 9000, maxItems As Integer = 512) As Optional Of DiscoveryDatagram
+        DNSRequire(Not Me.closed And Me.socket <> Nil, "session is not open")
+        DNSRequire(maxPacketBytes >= 12 And maxPacketBytes <= 65535 And maxItems >= 0 And maxItems <= 4096, "invalid receive budgets")
+        If Not Me.socket.HasPendingDatagram() Then Return None
+        Dim raw As Bytes = Me.socket.Read(65535)
+        Dim output As New DiscoveryDatagram()
+        output.PeerAddress = Me.socket.PeerAddress
+        output.PeerPort = Me.socket.PeerPort
+        output.Message = ParseDNSMessage(raw, maxPacketBytes, maxItems)
+        Return Some(output)
+    End Function
+
+    Public Sub Close()
+        If Me.closed Then Exit Sub
+        Me.closed = True
+        If Me.socket <> Nil Then Me.socket.Close()
+        Me.socket = Nil
+    End Sub
+End Class

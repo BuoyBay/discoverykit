@@ -1,0 +1,10 @@
+Import discoverykit
+
+' Offline example. No socket is opened and no multicast request is transmitted.
+Sub Main()
+    Dim query As Bytes = BuildDNSQuery("_http._tcp.local.")
+    Dim decoded As DNSMessage = ParseDNSMessage(query)
+    Print "Question: " + decoded.Questions(0).Name
+    Print "Wire bytes: " + query.ToHex()
+    Print "Use DiscoverySession.Open then SendQuery for explicit live discovery."
+End Sub
