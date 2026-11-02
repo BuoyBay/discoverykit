@@ -1,4 +1,4 @@
-# DNS packets and IPv4 mDNS queries
+# DNS packets and mDNS
 
 Portable bounded DNS/DNS-SD wire parsing and explicit IPv4 mDNS query transport.
 Copy `packages/discoverykit-0.1.0.buipkg` into a project's `packages/` directory
