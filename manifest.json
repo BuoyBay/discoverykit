@@ -1,1 +1,1 @@
-{"schema":1,"name":"discoverykit","version":"0.1.0","description":"Encode DNS packets and query mDNS services"}
+{"schema":1,"name":"discoverykit","version":"0.1.0","description":"DNS packets and IPv4 mDNS queries"}
