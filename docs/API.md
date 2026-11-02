@@ -105,12 +105,9 @@ IPv6 multicast transport, DNSSEC verification or incoming IP TTL validation.
 Incoming IP TTL is not exposed by Buoy's public API. Packets and discovered
 services are untrusted network input; discovery does not authenticate a peer.
 
-## Build and verification
+## Platform requirements
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-Linux x86_64 execution is verified. macOS/Windows are compiler-checked; live
-multicast, cross-host service discovery and native execution on those platforms
-remain unperformed. `BUOY` and `BPM_PACKAGER` select compiler and sealer commands.
-Rebuild the checked-in archive with `/usr/bin/buoy pkg seal libraries/discoverykit
--o packages/discoverykit-0.1.0.buipkg`. See [provenance](../PROVENANCE.md).
+The DNS codec is platform-independent source. The optional mDNS transport also
+needs a supported IPv4 socket backend and a network that permits multicast.
+No discovery query is sent until the caller explicitly opens/sends through the
+transport.

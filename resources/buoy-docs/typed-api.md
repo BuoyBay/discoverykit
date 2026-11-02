@@ -86,8 +86,6 @@ No parameters.
 | --- |
 | `Boolean` |
 
-## DiscoveryKit functions
-
 ### EncodeDNSName
 
 `Public Function EncodeDNSName(name As String) As Bytes`

@@ -2,7 +2,6 @@
 
 Independent Buoy implementation; no Bonjour, Avahi, Xojo or third-party DNS
 library source is copied. No native bridge or external data table is bundled.
-The deterministic Python fixture writer uses only Python's standard library.
 
 Protocol references:
 
