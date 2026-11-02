@@ -1,1 +1,1 @@
-{"schema":1,"name":"discoverykit","version":"0.1.0","description":"Bounded DNS/DNS-SD packet codec and explicit-lifecycle IPv4 mDNS query transport"}
+{"schema":1,"name":"discoverykit","version":"0.1.0","description":"Encode DNS packets and query mDNS services"}
